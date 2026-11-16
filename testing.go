@@ -3,7 +3,6 @@ package radiko
 import (
 	"net/http"
 	"os"
-	"path/filepath"
 )
 
 const areaIDTokyo = "JP13"
@@ -21,8 +20,7 @@ func init() {
 		outsideJP = true
 	}
 
-	GOPATH := os.Getenv("GOPATH")
-	testdataDir = filepath.Join(GOPATH, "src", "github.com/yyoshiki41/go-radiko", "testdata")
+	testdataDir = "testdata"
 }
 
 // For skipping tests.

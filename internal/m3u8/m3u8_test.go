@@ -8,10 +8,7 @@ import (
 )
 
 func readTestData(fileName string) *os.File {
-	const testDir = "github.com/yyoshiki41/go-radiko/testdata"
-
-	GOPATH := os.Getenv("GOPATH")
-	f, err := os.Open(filepath.Join(GOPATH, "src", testDir, fileName))
+	f, err := os.Open(filepath.Join("..", "..", "testdata", fileName))
 	if err != nil {
 		panic(err)
 	}
