@@ -31,7 +31,16 @@ const (
 	// Segment timestamps are off by tens of milliseconds,
 	// while a missing segment leaves a gap of about 5 seconds.
 	timeshiftGapTolerance = time.Second
+
+	// timeshiftMaxAttempts is how many times in a row a window may fail
+	// to advance before GetTimeshiftChunklist gives up.
+	timeshiftMaxAttempts = 8
 )
+
+// timeshiftRetryInterval is the base wait before requesting a window again.
+// The wait grows linearly with the number of attempts.
+// It is a variable so that tests can shorten it.
+var timeshiftRetryInterval = 500 * time.Millisecond
 
 // TimeshiftPlaylistM3U8 always returns ErrTimeshiftPlaylistM3U8Removed.
 //
@@ -47,6 +56,9 @@ func (c *Client) TimeshiftPlaylistM3U8(ctx context.Context, stationID string, st
 //
 // It requests the timefree playlist in 300-second windows
 // and joins the segments, checking that they are contiguous.
+// When segments are missing or a request fails with a server or network
+// error (or 408 / 429), it requests the same time again,
+// giving up after 8 attempts in a row that do not advance.
 // The returned segments can be downloaded without the auth token.
 //
 // Set areafree to true to get a program outside the current area
@@ -87,6 +99,8 @@ func (c *Client) GetTimeshiftChunklist(ctx context.Context, stationID string, st
 	var chunklist []string
 	// cursor is the end of the audio collected so far.
 	cursor := ft
+	// stalls counts consecutive windows that did not advance the cursor.
+	stalls := 0
 	for cursor.Before(to.Add(-timeshiftGapTolerance)) {
 		// A segment that starts slightly before start_at is not returned,
 		// so request from a little before the cursor and skip the overlap.
@@ -107,11 +121,13 @@ func (c *Client) GetTimeshiftChunklist(ctx context.Context, stationID string, st
 		query.Set("type", streamType)
 
 		segments, err := c.getTimeshiftSegments(ctx, playlistURL+"?"+query.Encode())
-		if err != nil {
+		if err != nil && !isRetryable(ctx, err) {
 			return nil, fmt.Errorf("failed to get segments at %s: %w", util.Datetime(windowStart), err)
 		}
 
 		previous := cursor
+		// gapEnd is the start of the first segment after missing segments.
+		gapEnd := to
 		for _, s := range segments {
 			if s.ProgramDateTime.IsZero() || s.Duration <= 0 {
 				return nil, errors.New("segment has no EXT-X-PROGRAM-DATE-TIME or duration")
@@ -125,19 +141,73 @@ func (c *Client) GetTimeshiftChunklist(ctx context.Context, stationID string, st
 			if !end.After(cursor.Add(timeshiftGapTolerance)) {
 				continue
 			}
+			// Keep the audio up to the gap.
+			// The next window requests the missing segments again.
 			if s.ProgramDateTime.After(cursor.Add(timeshiftGapTolerance)) {
-				return nil, fmt.Errorf("missing segments between %s and %s",
-					cursor.Format(time.RFC3339Nano), s.ProgramDateTime.Format(time.RFC3339Nano))
+				gapEnd = s.ProgramDateTime
+				break
 			}
 			chunklist = append(chunklist, s.URI)
 			cursor = end
 		}
-		if !cursor.After(previous) {
+
+		if cursor.After(previous) {
+			stalls = 0
+			continue
+		}
+		stalls++
+		if stalls >= timeshiftMaxAttempts {
+			if err != nil {
+				return nil, fmt.Errorf("failed to get segments at %s: %w", util.Datetime(windowStart), err)
+			}
 			return nil, fmt.Errorf("missing segments between %s and %s",
-				cursor.Format(time.RFC3339Nano), to.Format(time.RFC3339Nano))
+				cursor.Format(time.RFC3339Nano), gapEnd.Format(time.RFC3339Nano))
+		}
+		if err := sleepContext(ctx, time.Duration(stalls)*timeshiftRetryInterval); err != nil {
+			return nil, err
 		}
 	}
 	return chunklist, nil
+}
+
+// isRetryable reports whether requesting the timefree playlist again
+// may succeed after err.
+func isRetryable(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	var se *statusError
+	if errors.As(err, &se) {
+		switch {
+		case se.code == http.StatusRequestTimeout, se.code == http.StatusTooManyRequests:
+			return true
+		case se.code >= 400 && se.code < 500:
+			// A client error, such as an invalid auth token, does not change on retry.
+			return false
+		}
+	}
+	return true
+}
+
+func sleepContext(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// statusError is returned when a response has a status other than 200 OK.
+type statusError struct {
+	url  string
+	code int
+}
+
+func (e *statusError) Error() string {
+	return fmt.Sprintf("GET %s: status %d", e.url, e.code)
 }
 
 // timefreePlaylistCreateURL returns the timefree playlist url of the station.
@@ -199,7 +269,7 @@ func (c *Client) getWithAuthToken(ctx context.Context, u string) (*http.Response
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		return nil, fmt.Errorf("GET %s: status %d", u, resp.StatusCode)
+		return nil, &statusError{url: u, code: resp.StatusCode}
 	}
 	return resp, nil
 }

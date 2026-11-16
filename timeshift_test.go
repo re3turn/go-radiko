@@ -37,11 +37,17 @@ type fakeTimefreeServer struct {
 	// offset shifts EXT-X-PROGRAM-DATE-TIME from the 5-second grid.
 	// Real timestamps are off by tens of milliseconds in both directions.
 	offset time.Duration
-	// drop is the start time (on the grid) of a segment that is never served.
+	// drop is the start time (on the grid) of a segment that is not served.
 	drop time.Time
+	// dropTimes is how many media playlists omit drop.
+	// If it is 0, drop is never served.
+	dropTimes int
+	// failTimes is how many playlist requests fail with 503 first.
+	failTimes int
 
 	mu       sync.Mutex
 	requests []url.Values
+	dropped  int
 }
 
 func newFakeTimefreeServer(t *testing.T) *fakeTimefreeServer {
@@ -74,22 +80,28 @@ func newFakeTimefreeServer(t *testing.T) *fakeTimefreeServer {
 </urls>`, f.URL)
 	})
 	playlist := func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get(radikoAuthTokenHeader) != fakeAuthToken {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
 		q := r.URL.Query()
-		if l, err := strconv.Atoi(q.Get("l")); err != nil || l <= 0 || l > 300 {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
 		f.mu.Lock()
 		recorded := url.Values{"path": {r.URL.Path}}
 		for k, v := range q {
 			recorded[k] = v
 		}
 		f.requests = append(f.requests, recorded)
+		fail := len(f.requests) <= f.failTimes
 		f.mu.Unlock()
+
+		if r.Header.Get(radikoAuthTokenHeader) != fakeAuthToken {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if l, err := strconv.Atoi(q.Get("l")); err != nil || l <= 0 || l > 300 {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if fail {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 
 		// A relative uri, like the real endpoint may return.
 		fmt.Fprintf(w, "#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=52973,CODECS=\"mp4a.40.5\"\nmedialist?start_at=%s&l=%s\n",
@@ -107,23 +119,38 @@ func newFakeTimefreeServer(t *testing.T) *fakeTimefreeServer {
 		l, _ := strconv.Atoi(q.Get("l"))
 		end := start.Add(time.Duration(l) * time.Second)
 
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		dropped := false
+
 		fmt.Fprint(w, "#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-TARGETDURATION:5\n#EXT-X-MEDIA-SEQUENCE:1\n")
 		// Like the real endpoint, serve only segments that start at or after start_at.
 		for s := start.Truncate(segmentLength).Add(-segmentLength); s.Add(f.offset).Before(end); s = s.Add(segmentLength) {
 			pdt := s.Add(f.offset)
-			if pdt.Before(start) || s.Equal(f.drop) {
+			if pdt.Before(start) {
+				continue
+			}
+			if s.Equal(f.drop) && (f.dropTimes == 0 || f.dropped < f.dropTimes) {
+				dropped = true
 				continue
 			}
 			fmt.Fprintf(w, "#EXT-X-PROGRAM-DATE-TIME:%s\n#EXTINF:5.000,\n%s/segments/%s.aac\n",
 				pdt.Format(time.RFC3339Nano), f.URL, util.Datetime(s))
 		}
 		fmt.Fprint(w, "#EXT-X-ENDLIST\n")
+		if dropped {
+			f.dropped++
+		}
 	}
 	mux.HandleFunc("/tf/medialist", medialist)
 	mux.HandleFunc("/tf-areafree/medialist", medialist)
 
 	f.Server = httptest.NewServer(mux)
 	t.Cleanup(f.Close)
+
+	interval := timeshiftRetryInterval
+	timeshiftRetryInterval = time.Millisecond
+	t.Cleanup(func() { timeshiftRetryInterval = interval })
 	return f
 }
 
@@ -219,15 +246,16 @@ func TestGetTimeshiftChunklist_Areafree(t *testing.T) {
 	}
 }
 
+var missingSegmentCases = []struct {
+	name string
+	drop time.Duration
+}{
+	{name: "middle", drop: 10 * time.Minute},
+	{name: "last", drop: 30*time.Minute - segmentLength},
+}
+
 func TestGetTimeshiftChunklist_MissingSegment(t *testing.T) {
-	cases := []struct {
-		name string
-		drop time.Duration
-	}{
-		{name: "middle", drop: 10 * time.Minute},
-		{name: "last", drop: 30*time.Minute - segmentLength},
-	}
-	for _, tc := range cases {
+	for _, tc := range missingSegmentCases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeTimefreeServer(t)
 			start := fakeProgramStart(t)
@@ -237,7 +265,53 @@ func TestGetTimeshiftChunklist_MissingSegment(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), "missing segments") {
 				t.Errorf("expected a missing segments error, but %v", err)
 			}
+			// The window with the gap, and then the attempts that did not advance.
+			if expected := 1 + timeshiftMaxAttempts; f.dropped != expected {
+				t.Errorf("expected %d media playlists without the segment, but %d", expected, f.dropped)
+			}
 		})
+	}
+}
+
+func TestGetTimeshiftChunklist_RecoverMissingSegment(t *testing.T) {
+	for _, tc := range missingSegmentCases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeTimefreeServer(t)
+			start := fakeProgramStart(t)
+			f.drop = start.Add(tc.drop)
+			f.dropTimes = 3
+
+			chunklist, err := f.client(t).GetTimeshiftChunklist(context.Background(), fakeStationID, start, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertFakeChunklist(t, f, start, 30*time.Minute, chunklist)
+		})
+	}
+}
+
+func TestGetTimeshiftChunklist_RecoverServerError(t *testing.T) {
+	f := newFakeTimefreeServer(t)
+	start := fakeProgramStart(t)
+	f.failTimes = timeshiftMaxAttempts - 1
+
+	chunklist, err := f.client(t).GetTimeshiftChunklist(context.Background(), fakeStationID, start, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFakeChunklist(t, f, start, 30*time.Minute, chunklist)
+}
+
+func TestGetTimeshiftChunklist_ServerError(t *testing.T) {
+	f := newFakeTimefreeServer(t)
+	f.failTimes = timeshiftMaxAttempts
+
+	_, err := f.client(t).GetTimeshiftChunklist(context.Background(), fakeStationID, fakeProgramStart(t), false)
+	if err == nil || !strings.Contains(err.Error(), "status 503") {
+		t.Errorf("expected a 503 error, but %v", err)
+	}
+	if len(f.requests) != timeshiftMaxAttempts {
+		t.Errorf("expected %d requests, but %d", timeshiftMaxAttempts, len(f.requests))
 	}
 }
 
@@ -249,6 +323,61 @@ func TestGetTimeshiftChunklist_Unauthorized(t *testing.T) {
 	_, err := client.GetTimeshiftChunklist(context.Background(), fakeStationID, fakeProgramStart(t), false)
 	if err == nil || !strings.Contains(err.Error(), "status 401") {
 		t.Errorf("expected a 401 error, but %v", err)
+	}
+	// A client error is not retried.
+	if len(f.requests) != 1 {
+		t.Errorf("expected 1 request, but %d", len(f.requests))
+	}
+}
+
+func TestIsRetryable(t *testing.T) {
+	cases := []struct {
+		code     int
+		expected bool
+	}{
+		{code: http.StatusBadRequest, expected: false},
+		{code: http.StatusUnauthorized, expected: false},
+		{code: http.StatusNotFound, expected: false},
+		{code: http.StatusRequestTimeout, expected: true},
+		{code: http.StatusTooManyRequests, expected: true},
+		{code: http.StatusInternalServerError, expected: true},
+		{code: http.StatusServiceUnavailable, expected: true},
+	}
+	for _, c := range cases {
+		err := fmt.Errorf("wrapped: %w", &statusError{url: "http://example.com", code: c.code})
+		if got := isRetryable(context.Background(), err); got != c.expected {
+			t.Errorf("status %d: expected %t, but %t", c.code, c.expected, got)
+		}
+	}
+}
+
+func TestGetTimeshiftChunklist_Canceled(t *testing.T) {
+	f := newFakeTimefreeServer(t)
+	f.failTimes = timeshiftMaxAttempts
+	timeshiftRetryInterval = time.Hour
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(100*time.Millisecond, cancel)
+
+	_, err := f.client(t).GetTimeshiftChunklist(ctx, fakeStationID, fakeProgramStart(t), false)
+	if err != context.Canceled {
+		t.Errorf("expected context.Canceled, but %v", err)
+	}
+}
+
+// assertFakeChunklist checks that chunklist has every segment
+// of the program of length d that starts at ft, in order.
+func assertFakeChunklist(t *testing.T, f *fakeTimefreeServer, ft time.Time, d time.Duration, chunklist []string) {
+	t.Helper()
+
+	if expected := int(d / segmentLength); len(chunklist) != expected {
+		t.Fatalf("expected %d segments, but %d", expected, len(chunklist))
+	}
+	for i, c := range chunklist {
+		expected := fmt.Sprintf("%s/segments/%s.aac", f.URL, util.Datetime(ft.Add(time.Duration(i)*segmentLength)))
+		if c != expected {
+			t.Fatalf("chunklist[%d]: expected %s, but %s", i, expected, c)
+		}
 	}
 }
 
