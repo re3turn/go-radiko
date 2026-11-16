@@ -36,6 +36,12 @@ func Datetime(t time.Time) string {
 	return localTime.Format(datetimeLayout)
 }
 
+// ParseDatetime parses a string formatted in datetimeLayout
+// as a time in the Asia/Tokyo timezone.
+func ParseDatetime(s string) (time.Time, error) {
+	return time.ParseInLocation(datetimeLayout, s, location)
+}
+
 // ProgramsDate returns a textual representation of the time value
 // formatted in dateLayout.
 func ProgramsDate(t time.Time) string {
